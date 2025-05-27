@@ -1,0 +1,592 @@
+data class Video(
+    @SerializedName("video_id") val videoId: String
+)
+
+data class GameData(
+    val imageUrl: String,
+    val id: Int,
+    val name: String,
+    val summary: String?,
+    val cover: CoverData?,
+    val videos: List<Video>? = null,
+    @SerializedName("video_id") val videoId: String
+)
+
+interface  IGDBApiService {
+    @POST("v4/games")
+    suspend fun getGameDetails(
+        @Header("Authorization") authHeader: String,
+        @Header("Client-ID") clientId: String = "application/json",
+        @Body requestBody: RequestBody
+    ): List<GameData>
+
+    @POST("v4/screenshots")
+    suspend fun getGameScreenshots(
+        @Header("Authorization") token: String,
+        @Header("Client-ID") clientId: String,
+        @Body requestBody: RequestBody
+    ): List<ScreenshotData>
+}
+
+@Entity(tableName = "games")
+data class Game(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val name: String,
+    val image: String,
+    val igdbId: String,
+    val summary: String?,
+    val description: String,
+)
+
+data class ScreenshotData(
+    val id: String,
+    val url: String
+)
+data class CoverData(val url: String?)
+
+@Dao
+interface GameDao {
+    @Insert
+    suspend fun insert(game: Game)
+    @Query("SELECT * FROM games")
+    fun getAllGames(): Flow<List<Game>>
+    @Query("SELECT * FROM games WHERE igdbId = :gameId")
+    fun getGameById(gameId: String): Game?
+}
+
+val MIGRATION_3_4 = object : Migration(3,4) {
+    override fun migrate(database: SupportSQLiteDatabase) {
+        database.execSQL("ALTER TABLE games ADD COLUMN screenshots TEXT NOT NULL DEFAULT 'undefined'")
+        database.execSQL("ALTER TABLE games ADD COLUMN videoId TEXT DEFAULT NULL")
+        database.execSQL("ALTER TABLE games ADD COLUMN summary TEXT DEFAULT NULL")
+    }
+}
+
+val MIGRATION_4_5 = object : Migration(4, 5) {
+    override fun migrate(database: SupportSQLiteDatabase) {
+        Log.d("RoomMigration", "Migrating from version 4 to 5...")
+    }
+}
+
+@Database(entities = [Game::class], version = 5, exportSchema = false)
+@TypeConverters(Converters::class)
+abstract class GameDatabase:RoomDatabase(){
+    abstract fun gameDao(): GameDao
+
+            companion object {
+                @Volatile
+                private var INSTANCE: GameDatabase? = null
+
+                fun getDatabase(context:Context): GameDatabase{
+                    return INSTANCE ?: synchronized(this) {
+                        val instance = Room.databaseBuilder(
+                            context.applicationContext,
+                            GameDatabase::class.java,
+                            "game-db"
+                        )
+                            .addMigrations(MIGRATION_3_4,MIGRATION_4_5)
+                            .build()
+                        INSTANCE = instance
+                        instance
+                    }
+                }
+            }
+}
+
+
+
+class GameViewModel(application: Application): AndroidViewModel(application) {
+
+    private val sharedPreferences =
+        application.getSharedPreferences("TwitchPrefs", Context.MODE_PRIVATE)
+
+
+    private val retrofit: Retrofit = Retrofit.Builder()
+        .baseUrl("https://api.igdb.com/")
+        .addConverterFactory(GsonConverterFactory.create())
+        .build()
+    private val apiService: IGDBApiService = retrofit.create(IGDBApiService::class.java)
+
+    private val db: GameDatabase = getDatabase(application)
+    private val gameDao: GameDao = db.gameDao()
+
+    private val _gameList = MutableStateFlow<List<Game>>(emptyList())
+    val gameList: StateFlow<List<Game>> = _gameList.asStateFlow()
+
+    fun fetchGames() {
+        viewModelScope.launch {
+            Log.d("Debug", "fetchGames() called!")
+            refreshTokenIfNeeded()
+
+            val storedToken = sharedPreferences.getString("access_token", null) ?: ""
+            val token = "Bearer $storedToken"
+
+            val query = APICalypse()
+                .fields("id,name,cover.url,version_parent,summary,genres.name")
+                .where("category = 0 & version_parent = null")
+                .sort("rating", Sort.DESCENDING)
+                .limit(100)
+                .buildQuery()
+
+            val requestBody = query.toRequestBody("application/json".toMediaType())
+            Log.d("Debug","FetchGames API Query: $query")
+
+            try {Log.d("GameViewModel", "Fetching games with token: $token")
+
+                val response = apiService.getGameDetails(token,"2u37pxhjgwzplhsg053lp81uc2x4ry",requestBody)
+                Log.d("Debug","API Raw Response: ${response.size}")
+
+                if (response.isNotEmpty()) {
+                    Log.d("GameViewModel", "IGDB API response: $response")
+
+                    val gameEntities = response.map { gameData ->
+                        val imageUrl = gameData.cover?.url?.let {"https:" + it.replace("t_thumb","t_cover_big")}
+                            ?: "https://postimg.cc/rzm46wmt"
+                        Log.d("Debug","Final Processed Cover Image URL: $imageUrl")
+
+                        val summary = gameData.summary ?: "No summary available"
+
+                        Game(
+                            igdbId = gameData.id.toString(),
+                            name = gameData.name,
+                            image = imageUrl,
+                            summary = summary,
+                            description = gameData.summary ?: "No description available",
+                        )
+                    }
+                    Log.d("Debug","Processed Game Entities: $gameEntities")
+                    gameEntities.forEach { game ->
+                        gameDao.insert(game)
+                    }
+                    Log.d("Debug","Before Updated Game List: ${_gameList.value}")
+                    _gameList.value =  gameEntities.toList()
+                    Log.d("Debug","Game List After Excluding Screenshots/Videos: ${_gameList.value}")
+                }
+              } catch (e: Exception) {
+                Log.d("GameViewModel", "Error fetching games: ${e.message}")
+              }
+            Log.d("Debug", "Fetched Game List: ${_gameList.value}")
+        }
+    }
+
+    private val _selectedGameDetails = MutableStateFlow<Game?>(null)
+   // val selectedGameDetails: StateFlow<Game?> = _selectedGameDetails.asStateFlow()
+
+    fun loadGameDetails(gameId: String) {
+        viewModelScope.launch {
+            val game = gameDao.getGameById(gameId)
+            _selectedGameDetails.value = game
+            val screenshots = fetchScreenshotsForGame(gameId)
+            val video = fetchVideoForGame(gameId)
+
+            Log.d("Debug", "Loaded Game: $game")
+            Log.d("Debug", "Screenshots for $gameId: $screenshots")
+            Log.d("Debug", "Video for $gameId: $video")
+        }
+    }
+
+    fun refreshTokenIfNeeded() {
+        val storedToken = sharedPreferences.getString("access_token", null) ?: ""
+
+        if (!isTokenExpired(storedToken)) {
+            Log.d("Debug", "Using existing token: $storedToken")
+        }else {
+            viewModelScope.launch {
+                val newTokenData = requestNewAccessToken()
+                saveAccessToken(newTokenData.first,newTokenData.second)
+            }
+        }
+    }
+
+    fun saveAccessToken(token: String,expiresIn: Long) {
+        sharedPreferences.edit {
+            putString("access_token",token)
+            putLong("token_expiry_time", System.currentTimeMillis() + (expiresIn * 1000))
+            apply()
+        }
+    }
+
+    fun isTokenExpired(token: String): Boolean {
+        val expiryTime = sharedPreferences.getLong("token_expiry_time",0)
+        return token.isEmpty() || System.currentTimeMillis() > expiryTime
+    }
+
+    suspend fun requestNewAccessToken(): Pair<String, Long> {
+        return withContext(Dispatchers.IO) {
+            val clientId = "2u37pxhjgwzplhsg053lp81uc2x4ry"
+            val clientSecret = "uf5vcbi6zgvcfu9lddns49dyqvnglw"
+            val url ="https://id.twitch.tv/oauth2/token?client_id=$clientId&client_secret=$clientSecret&grant_type=client_credentials"
+
+            val requestBody = ByteArray(0).toRequestBody(null)
+            val request = okhttp3.Request.Builder()
+                .url(url)
+                .post(requestBody)
+                .build()
+            val response = OkHttpClient().newCall(request).execute()
+
+            response.body?.string()?.let {
+                val json = org.json.JSONObject(it)
+                val token = json.getString("access_token")
+                val expiresIn = json.getLong("expires_in")
+                Pair(token,expiresIn)
+            } ?: Pair("",0)
+        }
+    }
+
+   suspend fun fetchScreenshotsForGame(gameId: String): List<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val storedToken = sharedPreferences.getString("access_token",null) ?: ""
+                val token = "Bearer $storedToken"
+
+                Log.d("Debug","Fetching screenshots for game ID: $gameId")
+
+                val query = APICalypse()
+                    .fields("screenshots.url")
+                    .where("id = $gameId")
+                    .limit(10)
+                    .buildQuery()
+
+                val requestBody = query.toRequestBody("application/json".toMediaType())
+                val requestBodyString = query
+
+                Log.d("Debug","API Query Sent: $query")
+                Log.d("Debug","Request Body Sent: $requestBodyString")
+
+                val response = apiService.getGameScreenshots(token,"2u37pxhjgwzplhsg053lp81uc2x4ry",requestBody)
+                Log.d("Debug","API Response for Screenshots: $response")
+
+                val screenshots = response.map{"https:" + it.url.replace("t_thumb","t_screenshot_med")}
+
+                Log.d("Debug","Processed Screenshot URLs: $screenshots")
+
+                screenshots
+
+            } catch (e: Exception) {
+                Log.e("GameViewModel","Error fetching screenshots for game $gameId: ${e.message}")
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun fetchVideoForGame(gameId: String): String? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val storedToken = sharedPreferences.getString("access_token",null) ?: ""
+                val token = "Bearer $storedToken"
+
+                val query = APICalypse()
+                    .fields("videos.video_id")
+                    .where("id = $gameId")
+                    .limit(1)
+                    .buildQuery()
+
+                val requestBody = query.toRequestBody("text/plain".toMediaType())
+                val response = apiService.getGameDetails(token, "2u37pxhjgwzplhsg053lp81uc2x4ry", requestBody)
+
+                val videoId = response.firstOrNull()?.videos?.firstOrNull().toString()
+
+                Log.d("Debug", "Fetched videoId for game $gameId: $videoId")
+                videoId
+            } catch (e: Exception) {
+                Log.e("Debug", "Error fetching video: ${e.message}")
+                null
+            }
+        }
+    }
+}
+
+    @Composable
+    fun GameCard(game: Game,navController:NavController) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp)
+                .clickable{navController.navigate("game_details/${game.id}")},
+            shape = RoundedCornerShape(12.dp),
+            elevation = CardDefaults.elevatedCardElevation()
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                    AsyncImage(
+                        model = game.image,
+                        contentDescription = "${game.name} Cover",
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp),
+                        contentScale = ContentScale.Crop,
+                    )
+                Log.d("GameCard","Image URL for ${game.name}: ${game.image}")
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(text = game.name,
+                    color = Color.Blue,
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(20.dp),
+                    textAlign = TextAlign.Center
+                    )
+            }
+        }
+    }
+
+    @Composable
+    fun MainScreen(gameViewModel: GameViewModel,navController: NavController) {
+        val gameListState = gameViewModel.gameList.collectAsState()
+        val gameList = gameListState.value
+
+        Scaffold { paddingValues ->
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(2),
+                modifier = Modifier.padding(paddingValues)
+            ){
+                items(gameList.filter { it.image.isNotEmpty() }) { game ->
+                    GameCard(game,navController)
+                }
+            }
+        }
+    }
+
+@Composable
+fun AppNavigation(navController: NavHostController,gameViewModel: GameViewModel) {
+    val currentGameList = gameViewModel.gameList.collectAsState(initial = emptyList()).value
+
+    NavHost(navController = navController, startDestination = "game_list") {
+        composable("main_screen") {
+            MainScreen(gameViewModel,navController)
+        }
+        composable("game_list") {
+            GameListScreen(navController,gameViewModel)
+        }
+        composable("game_details/{gameId}") { backStackEntry ->
+            val gameId = backStackEntry.arguments?.getString("gameId") ?: ""
+
+            Log.d("Debug","Navigating to GameDetailsScreen with gameID: $gameId")
+
+            val selectedGame = currentGameList.find {it.igdbId == gameId}
+
+            selectedGame?.let {
+                GameDetailsScreen(game = it, viewModel = gameViewModel)
+            } ?: Text(text = "Game not found")
+        }
+    }
+}
+
+@Composable
+fun GameListScreen(navController: NavController,gameViewModel: GameViewModel) {
+    val gameList = gameViewModel.gameList.collectAsStateWithLifecycle(initialValue = emptyList())
+    Log.d("Debug", "Game List in UI (before rendering): ${gameList.value}")
+
+    Box(modifier = Modifier
+        .fillMaxSize()
+        .background(Color.Black.copy(alpha = 0.85f))
+        .padding(8.dp)
+    ) {
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(2),
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(8.dp)
+    ) {
+        items(gameList.value) { game ->
+Log.d("Debug","Rendering Game: ${game.name} with image ${game.image}")
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp)
+                    .clickable {
+                        gameViewModel.loadGameDetails(game.igdbId)
+                        navController.navigate("game_details/${game.igdbId}")
+                    }
+            ) {
+                Column {
+                    AsyncImage(
+                        model = game.image,
+                        placeholder = painterResource(R.drawable.test),
+                        error = painterResource(R.drawable.test),
+                        contentDescription = "${game.name} Cover",
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp),
+                        contentScale = ContentScale.Crop,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(text = game.name, modifier = Modifier.padding(16.dp))
+                }
+            }
+        }
+    }
+    }
+    LaunchedEffect(Unit) {
+        if (gameList.value.isEmpty())
+        gameViewModel.fetchGames()
+
+    }
+}
+
+
+
+@Composable
+fun GameDetailsScreen(game: Game,viewModel: GameViewModel) {
+    Log.d("Debug", "Entered GameDetailsScreen for game: ${game.name}")
+
+    var screenshots by remember { mutableStateOf<List<String>>(emptyList()) }
+    var isVideoLoaded by remember { mutableStateOf(false) }
+    var isLoading by remember { mutableStateOf(true) }
+    var videoId by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(game.igdbId) {
+        Log.d("Debug","Fetching data for game: ${game.name}")
+
+        screenshots = viewModel.fetchScreenshotsForGame(game.igdbId)
+        videoId = viewModel.fetchVideoForGame(game.igdbId)
+
+        Log.d("Debug", "Fetched Screenshots for: $screenshots")
+        Log.d("Debug","Fetched Video ID: $videoId")
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.85f))
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        Text(
+            text = game.name,
+            style = MaterialTheme.typography.titleLarge,
+            color = Color.White,
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.fillMaxWidth()
+                .padding(20.dp),
+            textAlign = TextAlign.Center
+        )
+        AsyncImage(
+            model = game.image,
+            contentDescription = "${game.name} Cover",
+            modifier = Modifier.size(400.dp),
+            contentScale = ContentScale.Crop
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = game.description,
+            style = MaterialTheme.typography.titleLarge,
+            color = Color.White,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(15.dp),
+            textAlign = TextAlign.Center
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text(
+            text = "Screenshots",
+            style = MaterialTheme.typography.titleLarge,
+            color = Color.White,
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            textAlign = TextAlign.Center
+        )
+
+        LazyRow {
+            itemsIndexed(screenshots) { index, screenshotUrl ->
+                AsyncImage(
+                    model = screenshotUrl,
+                    contentDescription = "${game.name} Screenshot $index",
+                    modifier = Modifier.size(400.dp),
+                    contentScale = ContentScale.Crop,
+                    onLoading = { Log.d("Debug", "Loading Screenshot #$index: $screenshotUrl") },
+                    onError = {
+                        Log.d(
+                            "Debug",
+                            "Failed to load Screenshot #$index: $screenshotUrl"
+                        )
+                    }
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text(
+            text = "Gameplay Video",
+            style = MaterialTheme.typography.titleLarge,
+            color = Color.White,
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            textAlign = TextAlign.Center
+        )
+
+        Box(modifier = Modifier.fillMaxWidth().height(250.dp)) {
+            if (!isVideoLoaded) {
+                val thumbnailUrl = "https://img.youtube.com/vi/${videoId}/maxresdefault.jpg"
+                AsyncImage(
+                    model = thumbnailUrl,
+                    contentDescription = "Video Thumbnail",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { isVideoLoaded = true },
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.align(Alignment.Center),
+                    color = Color.White
+                )
+            }
+                AndroidView(
+                    factory = { context ->
+                        WebView(context).apply {
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            settings.allowFileAccess = true
+                            settings.allowContentAccess = true
+                            settings.mediaPlaybackRequiresUserGesture = false
+                            setBackgroundColor(android.graphics.Color.BLACK)
+
+                            webViewClient = object : WebViewClient() {
+                                override fun onPageFinished(view: WebView?,url: String?) {
+                                    isLoading = false
+                                }
+                            }
+                            loadUrl("https://www.youtube.com/embed/${videoId}")
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().height(250.dp)
+                )
+            }
+        }
+    }
+}
+
+
+
+
+        class MainActivity : ComponentActivity() {
+            private lateinit var gameViewModel: GameViewModel
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+
+                gameViewModel = ViewModelProvider(this)[GameViewModel::class.java]
+
+                setContent {
+                    GameShelfTheme {
+                        val navController = rememberNavController()
+                        AppNavigation(navController,gameViewModel)
+                    }
+                }
+                gameViewModel.fetchGames()
+            }
+        }
